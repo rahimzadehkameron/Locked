@@ -1,0 +1,12 @@
+{
+  "name": "winter-lock-in",
+  "version": "1.0.0",
+  "description": "Winter lock-in: shared habit leaderboard, personal to-dos and chat for a small crew.",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test"
+  },
+  "engines": { "node": ">=20" }
+}
