@@ -3,7 +3,9 @@ import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
 import { fileURLToPath } from "node:url";
-import { addDays, buildBoards, habitActiveOn, isBusted, taskActiveOn } from "./scoring.js";
+import {
+  addDays, buildBoards, habitActiveOn, isBusted, mondayOf, pointsBetween, targetOn, taskActiveOn,
+} from "./scoring.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT || 3000);
@@ -14,7 +16,10 @@ const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, "data");
 const DB_FILE = path.join(DATA_DIR, "db.json");
 const PUBLIC_DIR = path.join(__dirname, "public");
 const PROOF_DIR = path.join(DATA_DIR, "proofs");
+const BACKUP_DIR = path.join(DATA_DIR, "backups");
 const MAX_PROOF_BYTES = 4_000_000;
+const PHOTO_KEEP_DAYS = Number(process.env.PHOTO_KEEP_DAYS || 45);
+const MILESTONES = [7, 14, 21, 30, 50, 75, 100];
 const COLORS = ["#7dd3fc", "#f9a8d4", "#fcd34d", "#86efac", "#c4b5fd", "#fdba74"];
 
 const uid = () => crypto.randomBytes(6).toString("hex");
@@ -27,9 +32,16 @@ function load() {
     return JSON.parse(fs.readFileSync(DB_FILE, "utf8"));
   } catch {
     const t = todayStr();
+    const y = Number(t.slice(0, 4));
+    // Winter ends on the next March 20th unless the crew changes it.
+    const endDate = `${t > `${y}-03-20` ? y + 1 : y}-03-20`;
     const mk = (name, emoji) => ({ id: uid(), name, emoji, createdDate: t, archivedDate: null });
     return {
       startDate: t,
+      endDate,
+      passcode: null,
+      schedules: {},
+      milestones: {},
       players: [],
       sessions: {},
       habits: [
@@ -46,7 +58,11 @@ function load() {
   }
 }
 const db = load();
+db.schedules ||= {};
+db.milestones ||= {};
+db.endDate ||= `${Number(db.startDate.slice(0, 4)) + 1}-03-20`;
 let saveTimer = null;
+let lastBackup = null;
 function save() {
   clearTimeout(saveTimer);
   saveTimer = setTimeout(() => {
@@ -54,7 +70,36 @@ function save() {
     const tmp = DB_FILE + ".tmp";
     fs.writeFileSync(tmp, JSON.stringify(db));
     fs.renameSync(tmp, DB_FILE);
+    backupDaily();
   }, 50);
+}
+
+// One copy of the database per day, keeping the last 14.
+function backupDaily() {
+  const day = todayStr();
+  if (lastBackup === day) return;
+  lastBackup = day;
+  try {
+    fs.mkdirSync(BACKUP_DIR, { recursive: true });
+    fs.copyFileSync(DB_FILE, path.join(BACKUP_DIR, `db-${day}.json`));
+    const old = fs.readdirSync(BACKUP_DIR).filter((f) => f.startsWith("db-")).sort().slice(0, -14);
+    for (const f of old) fs.rmSync(path.join(BACKUP_DIR, f));
+  } catch (e) {
+    console.error("backup failed", e);
+  }
+}
+
+// Photos older than PHOTO_KEEP_DAYS are deleted to keep the disk from filling up.
+function sweepPhotos() {
+  try {
+    const cutoff = Date.now() - PHOTO_KEEP_DAYS * 86400000;
+    for (const f of fs.readdirSync(PROOF_DIR)) {
+      const file = path.join(PROOF_DIR, f);
+      if (fs.statSync(file).mtimeMs < cutoff) fs.rmSync(file);
+    }
+  } catch {
+    /* no photos yet */
+  }
 }
 process.on("SIGTERM", () => {
   if (saveTimer) {
@@ -73,6 +118,12 @@ class HttpError extends Error {
 }
 const clean = (s, max) => String(s ?? "").trim().replace(/\s+/g, " ").slice(0, max);
 
+const hashPass = (pass, salt) => crypto.scryptSync(String(pass), salt, 32).toString("hex");
+function passcodeOk(input) {
+  if (!db.passcode) return safeEqual(input ?? "", PASSCODE);
+  return safeEqual(hashPass(input ?? "", db.passcode.salt), db.passcode.hash);
+}
+
 function safeEqual(a, b) {
   const ha = crypto.createHash("sha256").update(String(a)).digest();
   const hb = crypto.createHash("sha256").update(String(b)).digest();
@@ -82,6 +133,7 @@ function safeEqual(a, b) {
 // Only today and yesterday can be edited (grace for forgetting to tick).
 function checkDate(date) {
   const t = todayStr();
+  if (t > db.endDate) throw new HttpError(400, "Winter's over, the final standings are locked");
   if (date !== t && date !== addDays(t, -1)) throw new HttpError(400, "You can only edit today or yesterday");
   return date;
 }
@@ -89,25 +141,68 @@ function checkDate(date) {
 // A check counts unless the crew has busted it.
 const counts = (check) => !!check && !isBusted(check);
 
-function proofsFor(dates) {
-  const out = [];
-  const add = (store, kind, keyToRef) => {
-    for (const [key, check] of Object.entries(store)) {
-      if (typeof check !== "object" || !dates.includes(key.split("|")[0])) continue;
-      const { date, refId, playerId } = keyToRef(key.split("|"));
-      out.push({
-        date, kind, refId, playerId,
-        proofId: check.proof,
-        ts: check.ts,
-        calls: Object.keys(check.calls || {}),
-        busted: isBusted(check),
-      });
-    }
-  };
-  add(db.habitChecks, "habit", ([date, refId, playerId]) => ({ date, refId, playerId }));
+function* proofChecks() {
+  for (const [key, check] of Object.entries(db.habitChecks)) {
+    if (typeof check !== "object") continue;
+    const [date, refId, playerId] = key.split("|");
+    yield { kind: "habit", date, refId, playerId, check };
+  }
   const owner = new Map(db.tasks.map((t) => [t.id, t.playerId]));
-  add(db.taskChecks, "task", ([date, refId]) => ({ date, refId, playerId: owner.get(refId) }));
-  return out;
+  for (const [key, check] of Object.entries(db.taskChecks)) {
+    if (typeof check !== "object") continue;
+    const [date, refId] = key.split("|");
+    yield { kind: "task", date, refId, playerId: owner.get(refId), check };
+  }
+}
+
+function labelFor(kind, refId) {
+  if (kind === "habit") {
+    const h = db.habits.find((x) => x.id === refId);
+    return h ? `${h.emoji} ${h.name}` : "habit";
+  }
+  return db.tasks.find((t) => t.id === refId)?.text || "task";
+}
+
+const proofView = ({ kind, date, refId, playerId, check }) => ({
+  kind, date, refId, playerId,
+  proofId: check.proof,
+  ts: check.ts,
+  label: labelFor(kind, refId),
+  calls: Object.entries(check.calls || {}).map(([id, v]) => ({ id, reason: v?.reason || "" })),
+  legit: Object.keys(check.legit || {}),
+  contest: check.contest || null,
+  busted: isBusted(check),
+});
+
+const proofsFor = (dates) => [...proofChecks()].filter((c) => dates.includes(c.date)).map(proofView);
+
+function say(text) {
+  db.messages.push({ id: uid(), system: true, text, ts: Date.now() });
+  if (db.messages.length > 1000) db.messages.splice(0, db.messages.length - 1000);
+}
+
+// Post a chat message when someone reaches a new streak milestone.
+function announceMilestones(player) {
+  const b = buildBoards(db, todayStr());
+  const items = [
+    { key: "perfect", label: "perfect-day", cur: b.perfect.find((r) => r.playerId === player.id)?.current ?? 0 },
+    ...b.habits.map((hb) => ({
+      key: hb.habitId,
+      label: db.habits.find((h) => h.id === hb.habitId)?.name ?? "habit",
+      cur: hb.rows.find((r) => r.playerId === player.id)?.current ?? 0,
+    })),
+  ];
+  for (const { key, label, cur } of items) {
+    let fresh = 0;
+    for (const m of MILESTONES) {
+      const k = `${player.id}|${key}|${m}`;
+      if (cur >= m) {
+        if (!db.milestones[k]) fresh = m;
+        db.milestones[k] = 1;
+      } else delete db.milestones[k]; // streak was reset, so it can be announced again
+    }
+    if (fresh) say(`🔥 ${player.name} hit a ${fresh}-day ${label} streak!`);
+  }
 }
 
 function stateFor(me) {
@@ -136,8 +231,39 @@ function stateFor(me) {
       .filter((h) => counts(db.habitChecks[`${d}|${h.id}|${me.id}`]))
       .map((h) => h.id);
   }
+  const monday = mondayOf(today);
+  const weekProgress = {};
+  const schedule = {};
+  for (const h of db.habits) {
+    if (h.archivedDate) continue;
+    const entries = db.schedules[me.id]?.[h.id] || [];
+    let done = 0;
+    for (let d = monday; d <= today; d = addDays(d, 1)) if (counts(db.habitChecks[`${d}|${h.id}|${me.id}`])) done++;
+    const target = targetOn(entries, today);
+    weekProgress[h.id] = { done, target };
+    const pending = entries.filter((e) => e.from > today).pop();
+    schedule[h.id] = { days: target, next: pending ? pending.days : null };
+  }
+  const boards = buildBoards(db, today);
+  const lastEnd = addDays(monday, -1);
+  const lastRows = pointsBetween(db, addDays(lastEnd, -6), lastEnd).sort((a, b) => b.points - a.points);
+  const over = today > db.endDate;
+  const photos = new Map();
+  for (const c of proofChecks()) if (!isBusted(c.check)) photos.set(c.playerId, (photos.get(c.playerId) || 0) + 1);
   return {
     today,
+    endDate: db.endDate,
+    meScheduled: !!me.scheduled,
+    weekProgress,
+    schedule,
+    lastWeek: lastEnd >= db.startDate && lastRows.some((r) => r.points) ? { start: addDays(lastEnd, -6), end: lastEnd, rows: lastRows } : null,
+    final: over
+      ? {
+          points: [...boards.points].sort((a, b) => b.total - a.total),
+          bestStreak: [...boards.perfect].sort((a, b) => b.best - a.best)[0] || null,
+          photos: db.players.map((p) => ({ playerId: p.id, count: photos.get(p.id) || 0 })),
+        }
+      : null,
     yesterday: addDays(today, -1),
     startDate: db.startDate,
     me: me.id,
@@ -152,7 +278,7 @@ function stateFor(me) {
     ),
     tasks: { [today]: tasksFor(today), [addDays(today, -1)]: tasksFor(addDays(today, -1)) },
     proofs: proofsFor([today, addDays(today, -1)]),
-    boards: buildBoards(db, today),
+    boards,
     messages: db.messages.slice(-150),
   };
 }
@@ -166,7 +292,7 @@ route(
   "POST",
   "/api/login",
   (req, body) => {
-    if (!safeEqual(body.passcode ?? "", PASSCODE)) throw new HttpError(401, "Wrong passcode");
+    if (!passcodeOk(body.passcode)) throw new HttpError(401, "Wrong passcode");
     let player;
     if (body.playerId) {
       player = db.players.find((p) => p.id === body.playerId);
@@ -177,7 +303,8 @@ route(
       if (db.players.some((p) => p.name.toLowerCase() === name.toLowerCase()))
         throw new HttpError(409, "That name is taken");
       if (db.players.length >= MAX_PLAYERS) throw new HttpError(403, "The crew is full");
-      player = { id: uid(), name, color: COLORS[db.players.length % COLORS.length] };
+      const color = COLORS.find((c) => !db.players.some((p) => p.color === c)) || COLORS[0];
+      player = { id: uid(), name, color, joined: todayStr(), scheduled: false };
       db.players.push(player);
     }
     const token = crypto.randomBytes(24).toString("hex");
@@ -246,6 +373,7 @@ route(
     fs.writeFileSync(path.join(PROOF_DIR, `${proof}.jpg`), buf);
     uncheck(store, key); // replacing a photo also clears old call-outs
     store[key] = { proof, ts: Date.now(), calls: {} };
+    announceMilestones(me);
     save();
     return stateFor(me);
   },
@@ -260,18 +388,153 @@ route("GET", "/api/proof/([a-f0-9]{16})", (req, body, me, [id]) => {
   }
 });
 
-// Call BS on someone's proof (or take the call back).
-route("POST", "/api/call-out", (req, body, me) => {
-  if (body.ownerId === me.id) throw new HttpError(400, "You can't call yourself out");
+// Drop a dispute once nobody is calling BS any more.
+function tidy(check) {
+  if (!Object.keys(check.calls || {}).length) {
+    delete check.contest;
+    check.legit = {};
+  }
+}
+
+function targetCheck(body, me) {
+  if (body.ownerId === me.id) throw new HttpError(400, "That's your own proof");
   if (!db.players.some((p) => p.id === body.ownerId)) throw new HttpError(404, "Unknown player");
   const { store, key } = checkTarget(body.kind, body.id, body.date, body.ownerId);
   const check = store[key];
-  if (!check || typeof check !== "object") throw new HttpError(404, "Nothing to call out");
+  if (!check || typeof check !== "object") throw new HttpError(404, "No photo to review");
   check.calls ||= {};
-  if (body.on) check.calls[me.id] = Date.now();
-  else delete check.calls[me.id];
+  check.legit ||= {};
+  return check;
+}
+
+// Call BS on someone's proof (or take the call back). One call is enough to flag it.
+route("POST", "/api/call-out", (req, body, me) => {
+  const check = targetCheck(body, me);
+  if (body.on) {
+    const reason = clean(body.reason, 100);
+    check.calls[me.id] = { ts: Date.now(), reason };
+    delete check.legit[me.id];
+    const owner = db.players.find((p) => p.id === body.ownerId);
+    say(`🚨 ${me.name} called BS on ${owner.name}'s ${labelFor(body.kind, body.id)}${reason ? `: "${reason}"` : ""}`);
+  } else delete check.calls[me.id];
+  tidy(check);
   save();
   return stateFor(me);
+});
+
+// The owner disputes a BS call. The others then vote and it only clears if more say "legit" than "fake".
+route("POST", "/api/contest", (req, body, me) => {
+  const { store, key } = checkTarget(body.kind, body.id, body.date, me.id);
+  const check = store[key];
+  if (!check || typeof check !== "object" || !isBusted(check)) throw new HttpError(400, "Nothing to contest");
+  if (check.contest) throw new HttpError(400, "Already contested");
+  const note = clean(body.note, 140);
+  check.contest = { ts: Date.now(), note };
+  check.legit = {};
+  say(`⚖️ ${me.name} is contesting the BS on their ${labelFor(body.kind, body.id)}${note ? `: "${note}"` : ""}. Vote on it!`);
+  save();
+  return stateFor(me);
+});
+
+route("POST", "/api/vote", (req, body, me) => {
+  const check = targetCheck(body, me);
+  if (!check.contest) throw new HttpError(400, "Nobody has contested this");
+  if (body.vote === "legit") {
+    check.legit[me.id] = Date.now();
+    delete check.calls[me.id];
+  } else if (body.vote === "fake") {
+    check.calls[me.id] = { ts: Date.now(), reason: "voted fake" };
+    delete check.legit[me.id];
+  } else throw new HttpError(400, "Vote legit or fake");
+  tidy(check);
+  save();
+  return stateFor(me);
+});
+
+// Everyone's proof photos, newest first.
+route("GET", "/api/feed", (req) => {
+  const limit = Math.min(60, Number(new URL(req.url, "http://x").searchParams.get("limit")) || 24);
+  const items = [...proofChecks()].map(proofView).sort((a, b) => b.ts - a.ts);
+  return { items: items.slice(0, limit), more: items.length > limit };
+});
+
+// How many days a week each habit is expected. First time applies now; later edits start next Monday.
+route("POST", "/api/schedule", (req, body, me) => {
+  const first = !me.scheduled;
+  const from = addDays(mondayOf(todayStr()), 7);
+  for (const h of db.habits.filter((x) => !x.archivedDate)) {
+    const days = Math.round(Number(body.days?.[h.id] ?? 7));
+    if (!(days >= 1 && days <= 7)) throw new HttpError(400, "Pick 1 to 7 days a week");
+    db.schedules[me.id] ||= {};
+    const entries = (db.schedules[me.id][h.id] || []).filter((e) => e.from < from);
+    if (first) db.schedules[me.id][h.id] = [{ from: "0000-00-00", days }];
+    else {
+      entries.push({ from, days });
+      db.schedules[me.id][h.id] = entries;
+    }
+  }
+  me.scheduled = true;
+  save();
+  return stateFor(me);
+});
+
+route("POST", "/api/settings", (req, body, me) => {
+  if (body.endDate !== undefined) {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(body.endDate) || Number.isNaN(Date.parse(body.endDate)))
+      throw new HttpError(400, "Pick a valid end date");
+    if (body.endDate < db.startDate) throw new HttpError(400, "That's before the lock-in started");
+    db.endDate = body.endDate;
+  }
+  save();
+  return stateFor(me);
+});
+
+route("POST", "/api/passcode", (req, body, me) => {
+  if (!passcodeOk(body.current)) throw new HttpError(401, "Current passcode is wrong");
+  const next = String(body.next ?? "");
+  if (next.length < 4) throw new HttpError(400, "Use at least 4 characters");
+  const salt = crypto.randomBytes(8).toString("hex");
+  db.passcode = { salt, hash: hashPass(next, salt) };
+  save();
+  return stateFor(me);
+});
+
+// Remove a player and everything they did (their photos too).
+route("DELETE", "/api/players/([a-f0-9]+)", (req, body, me, [id]) => {
+  if (id === me.id) throw new HttpError(400, "You can't remove yourself");
+  const gone = db.players.find((p) => p.id === id);
+  if (!gone) throw new HttpError(404, "Unknown player");
+  const dropPhoto = (check) => check?.proof && fs.rm(path.join(PROOF_DIR, `${check.proof}.jpg`), () => {});
+  for (const [key, check] of Object.entries(db.habitChecks)) {
+    if (!key.endsWith(`|${id}`)) continue;
+    dropPhoto(check);
+    delete db.habitChecks[key];
+  }
+  const mine = new Set(db.tasks.filter((t) => t.playerId === id).map((t) => t.id));
+  for (const [key, check] of Object.entries(db.taskChecks)) {
+    if (!mine.has(key.split("|")[1])) continue;
+    dropPhoto(check);
+    delete db.taskChecks[key];
+  }
+  db.tasks = db.tasks.filter((t) => t.playerId !== id);
+  for (const check of [...Object.values(db.habitChecks), ...Object.values(db.taskChecks)]) {
+    if (typeof check !== "object") continue;
+    delete check.calls?.[id];
+    delete check.legit?.[id];
+    tidy(check);
+  }
+  for (const t of Object.keys(db.sessions)) if (db.sessions[t] === id) delete db.sessions[t];
+  db.players = db.players.filter((p) => p.id !== id);
+  delete db.schedules[id];
+  for (const k of Object.keys(db.milestones)) if (k.startsWith(`${id}|`)) delete db.milestones[k];
+  say(`${gone.name} left the lock-in.`);
+  save();
+  return stateFor(me);
+});
+
+route("GET", "/api/export", () => {
+  const { sessions: _s, passcode: _p, ...rest } = db; // never export login tokens or the passcode
+  return { raw: Buffer.from(JSON.stringify(rest, null, 2)), type: "application/json", filename: `lockin-backup-${todayStr()}.json` };
 });
 
 route("POST", "/api/habits", (req, body, me) => {
@@ -415,7 +678,11 @@ export const server = http.createServer(async (req, res) => {
       const body = req.method === "GET" ? {} : await readBody(req, { raw: r.raw });
       const out = r.handler(req, body, me, m.slice(1));
       if (out?.raw) {
-        res.writeHead(200, { "Content-Type": out.type, "Cache-Control": "private, max-age=86400" });
+        res.writeHead(200, {
+          "Content-Type": out.type,
+          "Cache-Control": out.filename ? "no-store" : "private, max-age=86400",
+          ...(out.filename ? { "Content-Disposition": `attachment; filename="${out.filename}"` } : {}),
+        });
         return res.end(out.raw);
       }
       return sendJson(res, 200, out);
@@ -429,6 +696,8 @@ export const server = http.createServer(async (req, res) => {
 });
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
+  sweepPhotos();
+  setInterval(sweepPhotos, 6 * 3600 * 1000).unref();
   server.listen(PORT, () => {
     console.log(`Winter Lock-In running on :${PORT} (passcode "${PASSCODE}", tz ${TIMEZONE})`);
     if (!process.env.LOCKIN_PASSCODE) console.log("Set LOCKIN_PASSCODE to change the default passcode.");

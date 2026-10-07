@@ -57,3 +57,20 @@ main{padding:0 16px 16px;max-width:640px;margin:0 auto}
 .proofimg{width:100%;max-height:55vh;object-fit:contain;border-radius:12px;background:#000;display:block}
 .busted{background:#7f1d1d;color:#fecaca;border-radius:10px;padding:8px 10px;margin-top:8px;font-weight:700}
 .btn.danger{background:#ef4444;color:#fff}
+.chips{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:6px}
+.chip{background:var(--card2);border:1px solid var(--line);border-radius:999px;padding:6px 12px;cursor:pointer;color:var(--text)}
+.stepper{display:flex;align-items:center;gap:10px}
+.stepper button{width:34px;height:34px;border-radius:50%;border:1px solid var(--line);background:var(--card2);font-size:20px;cursor:pointer;line-height:1}
+.stepper b{min-width:28px;text-align:center}
+.banner{background:linear-gradient(135deg,#16324f,#1b2a52);border-color:#2f5d8c}
+.sysmsg{align-self:center;text-align:center;font-size:13px;color:var(--dim);background:var(--card2);border-radius:999px;padding:5px 12px;max-width:92%}
+.toast{position:fixed;left:16px;right:16px;bottom:calc(84px + env(safe-area-inset-bottom));max-width:420px;margin:0 auto;background:#0f2a3d;border:1px solid #2f5d8c;border-radius:14px;padding:10px 14px;display:flex;justify-content:space-between;align-items:center;gap:10px;z-index:20}
+.toast button{background:var(--ice);color:#04202e;border:0;border-radius:10px;padding:6px 12px;font-weight:700;cursor:pointer}
+.feed{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:12px}
+.tile{position:relative;aspect-ratio:3/4;border:1px solid var(--line);border-radius:14px;overflow:hidden;padding:0;background:var(--card);cursor:pointer}
+.tile img{width:100%;height:100%;object-fit:cover;display:block}
+.tile .cap{position:absolute;left:0;right:0;bottom:0;padding:18px 8px 6px;background:linear-gradient(transparent,rgba(0,0,0,.85));font-size:12px;text-align:left;color:#fff}
+.tile .cap small{display:block;color:#b6c4d8;font-size:11px}
+.tile.bust{border-color:#f87171}
+.tile .badge{position:absolute;top:6px;right:6px;background:#7f1d1d;color:#fecaca;border-radius:8px;padding:2px 7px;font-size:12px;font-weight:700}
+.field{width:100%}

@@ -11,6 +11,10 @@ let tab = store.get("lockin-tab") || "today";
 let boardMode = "week";
 let chatDraft = "";
 let pollTimer = null;
+let feed = null; // photo feed items (loaded when the Feed tab is open)
+let feedLimit = 24;
+let feedMore = false;
+let schedDraft = null; // weekly-schedule editor state: habitId -> days
 
 // ---------- tiny DOM helper (text is always set via textContent, never innerHTML) ----------
 function h(tag, props = {}, ...kids) {
@@ -89,7 +93,13 @@ async function renderLogin() {
 // ---------- main ----------
 async function refresh(render = true) {
   S = await api("GET", "/api/state");
+  if (tab === "feed") await loadFeed(false);
   if (render) renderMain();
+}
+async function loadFeed(render = true) {
+  const r = await api("GET", `/api/feed?limit=${feedLimit}`);
+  feed = r.items; feedMore = r.more;
+  if (render && tab === "feed") renderMain();
 }
 function start() {
   refresh().catch(() => {});
@@ -106,23 +116,67 @@ async function act(method, url, body) {
 }
 
 function fmtDay(d) { return new Date(d + "T12:00:00").toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric" }); }
-function dayNumber() { return Math.floor((new Date(S.today) - new Date(S.startDate)) / 86400000) + 1; }
+const daysBetween = (a, b) => Math.round((new Date(b) - new Date(a)) / 86400000);
+function dayLabel() {
+  if (S.today > S.endDate) return "Winter's over ❄️";
+  return `Day ${daysBetween(S.startDate, S.today) + 1} of ${daysBetween(S.startDate, S.endDate) + 1}`;
+}
+const editable = (date) => S.today <= S.endDate && (date === S.today || date === S.yesterday);
 
 function renderMain() {
   if (!S) return;
+  if (!S.meScheduled) { renderOnboarding(); return; }
   const me = player(S.me);
-  const view = { today: viewToday, board: viewBoard, chat: viewChat, crew: viewCrew }[tab]();
-  const tabs = [["today", "✅", "Today"], ["board", "🏆", "Board"], ["crew", "👥", "Crew"], ["chat", "💬", "Chat"]];
+  if (tab === "feed" && feed === null) loadFeed();
+  const view = { today: viewToday, board: viewBoard, chat: viewChat, crew: viewCrew, feed: viewFeed, settings: viewSettings }[tab]();
+  const tabs = [["today", "✅", "Today"], ["board", "🏆", "Board"], ["feed", "📸", "Feed"], ["crew", "👥", "Crew"], ["chat", "💬", "Chat"]];
   $app.replaceChildren(
     h("header", { class: "top" },
-      h("div", {}, h("h1", {}, "❄️ Winter Lock-In"), h("small", {}, `Day ${dayNumber()} · ${fmtDay(S.today)}`)),
-      h("button", { class: "x", title: "Switch user", onclick: logout }, avatar(me, 34))),
+      h("div", {}, h("h1", {}, "❄️ Winter Lock-In"), h("small", {}, `${dayLabel()} · ${fmtDay(S.today)}`)),
+      h("button", { class: "x", title: "Settings", onclick: () => { schedDraft = null; tab = tab === "settings" ? "today" : "settings"; renderMain(); } }, avatar(me, 34))),
     h("main", {}, view),
     h("nav", { class: "tabs" }, tabs.map(([id, icon, label]) =>
       h("button", { class: tab === id ? "on" : "", onclick: () => { tab = id; store.set("lockin-tab", id); renderMain(); } },
         h("b", {}, icon), label))));
   if (tab === "chat") scrollChat();
   renderModal();
+}
+
+function toast(text, label, onAction) {
+  document.getElementById("toast")?.remove();
+  const t = h("div", { id: "toast", class: "toast" }, text,
+    label && h("button", { onclick: () => { t.remove(); onAction(); } }, label));
+  document.body.append(t);
+  setTimeout(() => t.remove(), 7000);
+}
+
+// ---------- Weekly schedule (onboarding + settings) ----------
+function scheduleEditor() {
+  schedDraft ||= Object.fromEntries(S.habits.map((x) => [x.id, S.schedule[x.id]?.next ?? S.schedule[x.id]?.days ?? 7]));
+  const setAll = (n) => { for (const x of S.habits) schedDraft[x.id] = n; renderMain(); };
+  return h("div", {},
+    h("div", { class: "chips" }, [7, 6, 5, 4, 3].map((n) =>
+      h("button", { class: "chip", onclick: () => setAll(n) }, n === 7 ? "Every day" : `${n}×/week`))),
+    S.habits.map((x) => h("div", { class: "row" },
+      h("span", { class: "label" }, `${x.emoji} ${x.name}`),
+      h("div", { class: "stepper" },
+        h("button", { onclick: () => { schedDraft[x.id] = Math.max(1, (schedDraft[x.id] ?? 7) - 1); renderMain(); } }, "−"),
+        h("b", {}, `${schedDraft[x.id] ?? 7}×`),
+        h("button", { onclick: () => { schedDraft[x.id] = Math.min(7, (schedDraft[x.id] ?? 7) + 1); renderMain(); } }, "+")))),
+    h("div", { class: "muted", style: "margin-top:6px" },
+      "Days per week you commit to. The days you don't need are rest days: skipping them won't break your streak."));
+}
+async function saveSchedule() {
+  await act("POST", "/api/schedule", { days: schedDraft });
+  schedDraft = null;
+  if (tab === "settings") toast("Saved. Changes start next Monday.");
+}
+function renderOnboarding() {
+  $app.replaceChildren(h("div", { class: "login" },
+    h("h1", {}, `Hey ${player(S.me).name} 👋`),
+    h("p", { class: "muted" }, "Set your baseline. How many days a week are you locking in on each habit?"),
+    h("section", { class: "card" }, scheduleEditor()),
+    h("button", { class: "btn", style: "width:100%", onclick: saveSchedule }, "Start locking in")));
 }
 
 // ---------- Today ----------
@@ -144,7 +198,10 @@ function viewToday() {
         const ref = { date, kind: "habit", refId: x.id, playerId: S.me };
         return h("div", { class: "row" },
           checkButton(ref, myDone.has(x.id), x.name),
-          h("span", { class: "label" }, `${x.emoji} ${x.name}`),
+          h("span", { class: "label" }, `${x.emoji} ${x.name}`,
+            isToday && S.weekProgress[x.id]?.target < 7 &&
+              h("span", { class: "pill", style: "margin-left:8px", title: "This week vs your weekly goal" },
+                `${S.weekProgress[x.id].done}/${S.weekProgress[x.id].target} wk`)),
           isToday && h("span", { class: "dots" }, dones.map((id) =>
             h("button", { class: "dotbtn", title: `See ${player(id).name}'s proof`,
               onclick: () => openProof({ date, kind: "habit", refId: x.id, playerId: id }) }, avatar(player(id), 20)))),
@@ -194,6 +251,8 @@ function addTaskForm() {
 // ---------- Board ----------
 function viewBoard() {
   const parts = [];
+  if (S.final) parts.push(finalCard());
+  else if (S.lastWeek) parts.push(lastWeekCard());
   const key = boardMode === "week" ? "week" : "total";
   parts.push(h("section", { class: "card" },
     h("h2", {}, "Points"),
@@ -206,7 +265,7 @@ function viewBoard() {
 
   parts.push(h("section", { class: "card" },
     h("h2", {}, "🔥 Perfect-day streak"),
-    h("div", { class: "muted" }, "Every shared habit done, day after day."),
+    h("div", { class: "muted" }, "Every shared habit done, day after day. Scheduled rest days don't break it."),
     rankRows([...S.boards.perfect].sort((a, b) => b.current - a.current || b.best - a.best || b.total - a.total),
       (r) => [`${r.current}d`, `best ${r.best}d · ${r.total} days total`])));
 
@@ -216,9 +275,31 @@ function viewBoard() {
     parts.push(h("section", { class: "card" },
       h("h2", {}, `${habit.emoji} ${habit.name}`),
       rankRows([...hb.rows].sort((a, b) => b.current - a.current || b.total - a.total || b.best - a.best),
-        (r) => [`${r.current}d`, `best ${r.best}d · ${r.total} days`])));
+        (r) => [`${r.current}d`, `best ${r.best}d · ${r.total} days${r.target < 7 ? ` · ${r.target}×/wk` : ""}`])));
   }
   return parts;
+}
+function lastWeekCard() {
+  const { rows, start, end } = S.lastWeek;
+  const top = rows[0], last = rows[rows.length - 1];
+  return h("section", { class: "card banner" },
+    h("h2", {}, `🏅 Last week · ${fmtDay(start)} – ${fmtDay(end)}`),
+    h("div", {}, h("b", {}, player(top.playerId).name), ` won with ${top.points} pts.`),
+    rows.length > 1 && last.playerId !== top.playerId &&
+      h("div", { class: "muted", style: "margin-top:4px" },
+        `☕ ${player(last.playerId).name} finished last (${last.points}), so they pick this week's challenge or buy coffee.`));
+}
+function finalCard() {
+  const f = S.final;
+  const champ = f.points[0];
+  const best = f.bestStreak && f.bestStreak.best > 0 ? f.bestStreak : null;
+  const mostPhotos = [...f.photos].sort((a, b) => b.count - a.count)[0];
+  return h("section", { class: "card banner" },
+    h("h2", {}, "🏆 Final standings"),
+    h("div", { style: "font-size:20px" }, "👑 ", h("b", {}, player(champ.playerId).name), ` wins with ${champ.total} pts!`),
+    best && h("div", { class: "muted", style: "margin-top:6px" }, `🔥 Longest perfect streak: ${player(best.playerId).name} (${best.best} days)`),
+    mostPhotos?.count > 0 && h("div", { class: "muted" }, `📸 Most proof photos: ${player(mostPhotos.playerId).name} (${mostPhotos.count})`),
+    h("div", { class: "muted", style: "margin-top:6px" }, "Everything is locked now. Great winter, crew."));
 }
 function rankRows(rows, fmt) {
   return rows.map((r, i) => {
@@ -252,12 +333,13 @@ function viewCrew() {
 function chatMessages() {
   let last = null;
   return S.messages.map((m) => {
+    if (m.system) { last = null; return h("div", { class: "sysmsg" }, m.text); }
     const mine = m.playerId === S.me;
     const p = player(m.playerId);
     const showName = !mine && last !== m.playerId;
     last = m.playerId;
     const time = new Date(m.ts).toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
-    return h("div", { class: `msg ${mine ? "me" : ""}`, title: time }, showName && h("span", { class: "who" }, p ? p.name : "?"), m.text);
+    return h("div", { class: `msg ${mine ? "me" : ""}`, title: time }, showName && h("span", { class: "who" }, p ? p.name : "Former member"), m.text);
   });
 }
 function scrollChat() { const c = document.getElementById("chat"); if (c) c.scrollTop = c.scrollHeight; }
@@ -285,7 +367,8 @@ function viewChat() {
 }
 
 // ---------- photo proof ----------
-const proofOf = (r) => S.proofs.find((x) => x.date === r.date && x.kind === r.kind && x.refId === r.refId && x.playerId === r.playerId);
+const sameRef = (r) => (x) => x.date === r.date && x.kind === r.kind && x.refId === r.refId && x.playerId === r.playerId;
+const proofOf = (r) => S.proofs.find(sameRef(r)) || feed?.find(sameRef(r));
 const refQuery = (r) => `kind=${r.kind}&id=${r.refId}&date=${r.date}`;
 
 // Unticked -> take/pick a photo (that's what ticks it). Ticked -> look at the proof.
@@ -326,6 +409,8 @@ function pickPhoto(ref) {
       const data = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(data.error || "Upload failed");
       S = data; closeModal(); renderMain();
+      toast("Checked off ✓", "Undo", () => act("POST", ref.kind === "habit" ? "/api/habit-check" : "/api/task-check",
+        { habitId: ref.refId, taskId: ref.refId, date: ref.date, done: false }));
     } catch (e) { alert(e.message); }
     busy.remove();
   });
@@ -346,6 +431,8 @@ let modalRef = null;
 function closeModal() { modalRef = null; document.getElementById("modal")?.remove(); }
 function openProof(ref) { modalRef = ref; renderModal(); }
 function itemName(ref) {
+  const pr = proofOf(ref);
+  if (pr?.label) return pr.label;
   if (ref.kind === "habit") { const x = S.habits.find((y) => y.id === ref.refId); return x ? `${x.emoji} ${x.name}` : "habit"; }
   for (const d of Object.values(S.tasks)) { const t = d.find((y) => y.id === ref.refId); if (t) return t.text; }
   return "task";
@@ -354,13 +441,48 @@ function renderModal() {
   document.getElementById("modal")?.remove();
   if (!modalRef || !S) return;
   const ref = modalRef, pr = proofOf(ref), owner = player(ref.playerId), mine = ref.playerId === S.me;
-  if (!pr && !mine) { closeModal(); return; }
+  if (!owner || (!pr && !mine)) { closeModal(); return; }
+  const canEdit = editable(ref.date);
   const calls = pr ? pr.calls : [];
-  const iCalled = calls.includes(S.me);
+  const iCalled = calls.some((c) => c.id === S.me);
+  const iVotedLegit = !!pr?.legit.includes(S.me);
   const img = h("img", { class: "proofimg", alt: "proof" });
-  if (pr) photoUrl(pr.proofId).then((u) => (img.src = u)).catch(() => img.replaceWith(h("div", { class: "muted" }, "Photo missing")));
-  const remove = () => act("POST", ref.kind === "habit" ? "/api/habit-check" : "/api/task-check",
-    { habitId: ref.refId, taskId: ref.refId, date: ref.date, done: false }).then(closeModal);
+  if (pr) photoUrl(pr.proofId).then((u) => (img.src = u)).catch(() => img.replaceWith(h("div", { class: "muted" }, "Photo expired (old photos are cleaned up)")));
+  const uncheckBody = { habitId: ref.refId, taskId: ref.refId, date: ref.date, done: false };
+  const remove = () => act("POST", ref.kind === "habit" ? "/api/habit-check" : "/api/task-check", uncheckBody).then(closeModal);
+  const target = { kind: ref.kind, id: ref.refId, date: ref.date, ownerId: ref.playerId };
+  const callBS = () => {
+    const reason = prompt(`Why is this BS? (optional, ${owner.name} will see it)`);
+    if (reason !== null) act("POST", "/api/call-out", { ...target, on: true, reason });
+  };
+  const contest = () => {
+    const note = prompt("Say why it's legit (optional). The others will vote.");
+    if (note !== null) act("POST", "/api/contest", { kind: ref.kind, id: ref.refId, date: ref.date, note });
+  };
+  const vote = (v) => act("POST", "/api/vote", { ...target, vote: v });
+  const myVote = iVotedLegit ? "legit" : iCalled ? "fake" : null;
+
+  let actions = null;
+  if (canEdit && pr) {
+    if (mine) {
+      actions = h("div", {},
+        pr.busted && !pr.contest && h("button", { class: "btn", style: "width:100%;margin-bottom:8px", onclick: contest }, "⚖️ Contest it. It's legit"),
+        h("div", { class: "add" },
+          h("button", { class: "btn ghost", onclick: () => { closeModal(); pickPhoto(ref); } }, "Replace photo"),
+          h("button", { class: "btn ghost", onclick: remove }, "Uncheck")));
+    } else if (pr.contest) {
+      actions = h("div", {},
+        h("div", { class: "muted", style: "margin-bottom:6px" }, "Cast your vote:"),
+        h("div", { class: "add", style: "margin-top:0" },
+          h("button", { class: myVote === "legit" ? "btn" : "btn ghost", onclick: () => vote("legit") }, "✅ Legit"),
+          h("button", { class: myVote === "fake" ? "btn danger" : "btn ghost", onclick: () => vote("fake") }, "🚨 Fake")));
+    } else {
+      actions = h("button", { class: iCalled ? "btn ghost" : "btn danger", style: "width:100%",
+        onclick: iCalled ? () => act("POST", "/api/call-out", { ...target, on: false }) : callBS },
+        iCalled ? "Take my BS call back" : calls.length ? "🚨 I agree, it's BS" : "🚨 Call BS");
+    }
+  }
+
   const modal = h("div", { class: "overlay", id: "modal", onclick: (e) => e.target.classList.contains("overlay") && closeModal() },
     h("div", { class: "sheet" },
       h("div", { class: "row", style: "border:0;padding-top:0" }, avatar(owner), h("div", { class: "label" },
@@ -368,18 +490,71 @@ function renderModal() {
         h("div", { class: "muted" }, pr ? new Date(pr.ts).toLocaleString(undefined, { weekday: "short", hour: "numeric", minute: "2-digit" }) : "")),
         h("button", { class: "x", onclick: closeModal }, "✕")),
       pr ? img : h("div", { class: "muted" }, "Checked off before photo proof existed."),
-      pr?.busted && h("div", { class: "busted" }, "🚨 BS! Someone called this fake, so it doesn't count."),
-      pr && h("div", { class: "muted", style: "margin:8px 0" }, calls.length
-        ? `🚨 BS called by ${calls.map((id) => player(id).name).join(", ")}`
-        : "Looks legit? If not, one BS call flags it."),
-      mine
-        ? h("div", { class: "add" },
-            h("button", { class: "btn ghost", onclick: () => { closeModal(); pickPhoto(ref); } }, "Replace photo"),
-            h("button", { class: "btn ghost", onclick: remove }, "Uncheck"))
-        : h("button", { class: iCalled ? "btn ghost" : "btn danger", style: "width:100%",
-            onclick: () => act("POST", "/api/call-out", { kind: ref.kind, id: ref.refId, date: ref.date, ownerId: ref.playerId, on: !iCalled }) },
-            iCalled ? "Take it back" : "🚨 Call BS")));
+      pr?.busted && h("div", { class: "busted" }, "🚨 BS! This is flagged as fake, so it doesn't count."),
+      calls.map((c) => h("div", { class: "muted", style: "margin-top:6px" },
+        `🚨 ${player(c.id)?.name ?? "Someone"} called BS${c.reason ? `: “${c.reason}”` : ""}`)),
+      pr?.contest && h("div", { class: "muted", style: "margin-top:6px" },
+        `⚖️ Contested${pr.contest.note ? `: “${pr.contest.note}”` : ""} · ${pr.legit.length} legit vs ${calls.length} fake. It clears if legit gets more votes.`),
+      pr && !calls.length && h("div", { class: "muted", style: "margin:8px 0" }, "Looks legit? If not, one BS call flags it."),
+      h("div", { style: "margin-top:10px" }, actions)));
   document.body.append(modal);
+}
+
+// ---------- Feed ----------
+function viewFeed() {
+  if (feed === null) return h("div", { class: "muted", style: "padding:16px" }, "Loading…");
+  if (!feed.length) return h("section", { class: "card" }, h("div", { class: "muted" }, "No proof photos yet. Be the first. 📸"));
+  return [
+    h("div", { class: "feed" }, feed.map((it) => {
+      const p = player(it.playerId);
+      const img = h("img", { alt: "", loading: "lazy" });
+      photoUrl(it.proofId).then((u) => (img.src = u)).catch(() => {});
+      return h("button", { class: `tile ${it.busted ? "bust" : ""}`, onclick: () => openProof(it) },
+        img,
+        it.busted && h("span", { class: "badge" }, "🚨 BS"),
+        h("span", { class: "cap" }, `${p ? p.name : "?"} · ${it.label}`,
+          h("small", {}, new Date(it.ts).toLocaleString(undefined, { weekday: "short", hour: "numeric", minute: "2-digit" }))));
+    })),
+    feedMore && h("button", { class: "btn ghost", style: "width:100%;margin-top:12px", onclick: () => { feedLimit += 24; loadFeed(); } }, "Load more"),
+  ];
+}
+
+// ---------- Settings ----------
+function viewSettings() {
+  const curPass = h("input", { class: "field", type: "password", placeholder: "Current passcode", autocomplete: "off" });
+  const newPass = h("input", { class: "field", type: "password", placeholder: "New passcode (4+ characters)", autocomplete: "new-password" });
+  const end = h("input", { class: "field", type: "date", value: S.endDate });
+  const download = async () => {
+    try {
+      const res = await fetch("/api/export", { headers: { Authorization: `Bearer ${token}` } });
+      if (!res.ok) throw new Error("Couldn't download the backup");
+      const url = URL.createObjectURL(await res.blob());
+      const a = h("a", { href: url, download: `lockin-backup-${S.today}.json` });
+      document.body.append(a); a.click(); a.remove();
+    } catch (e) { alert(e.message); }
+  };
+  return [
+    h("section", { class: "card" }, h("h2", {}, "My weekly schedule"), scheduleEditor(),
+      h("button", { class: "btn", style: "width:100%;margin-top:10px", onclick: saveSchedule }, "Save schedule"),
+      h("div", { class: "muted", style: "margin-top:6px" }, "Edits apply from next Monday so nobody can dodge a streak mid-week.")),
+    h("section", { class: "card" }, h("h2", {}, "Winter ends"),
+      h("div", { class: "add", style: "margin-top:0" }, end,
+        h("button", { class: "btn ghost", onclick: () => act("POST", "/api/settings", { endDate: end.value }) }, "Save"))),
+    h("section", { class: "card" }, h("h2", {}, "Crew passcode"), curPass, h("div", { style: "height:8px" }), newPass,
+      h("button", { class: "btn ghost", style: "width:100%;margin-top:10px", onclick: async () => {
+        try { S = await api("POST", "/api/passcode", { current: curPass.value, next: newPass.value }); toast("Passcode changed"); renderMain(); }
+        catch (e) { alert(e.message); }
+      } }, "Change passcode")),
+    h("section", { class: "card" }, h("h2", {}, "Crew"),
+      S.players.map((p) => h("div", { class: "row" }, avatar(p), h("span", { class: "label" }, p.name, p.id === S.me && h("span", { class: "muted" }, " (you)")),
+        p.id !== S.me && h("button", { class: "x", title: `Remove ${p.name}`, onclick: () => {
+          if (confirm(`Remove ${p.name} and delete all their check-ins and photos? This can't be undone.`)) act("DELETE", `/api/players/${p.id}`);
+        } }, "Remove")))),
+    h("section", { class: "card" }, h("h2", {}, "Backup"),
+      h("div", { class: "muted", style: "margin-bottom:8px" }, "Scores, lists and chat as a file. (Photos stay on the server.) The server also keeps a daily copy."),
+      h("button", { class: "btn ghost", style: "width:100%", onclick: download }, "Download backup")),
+    h("button", { class: "btn ghost", style: "width:100%", onclick: logout }, "Switch user / log out"),
+  ];
 }
 
 // ---------- boot ----------
