@@ -31,6 +31,21 @@ export function streaks(daySet, today) {
   return { current, best, total: daySet.size };
 }
 
+/**
+ * A check is either 1 (legacy, no proof) or { proof, ts, calls: { playerId: ts } }.
+ * It is "busted" when a majority of the *other* players called it fake.
+ */
+/** Majority of the other players: 1 of 1, 2 of 2, 2 of 3. */
+export function bustThreshold(playerCount) {
+  return Math.floor(Math.max(1, playerCount - 1) / 2) + 1;
+}
+
+export function isBusted(check, playerCount) {
+  const calls = check && typeof check === "object" ? Object.keys(check.calls || {}).length : 0;
+  const needed = bustThreshold(playerCount);
+  return calls >= needed;
+}
+
 export function habitActiveOn(h, date) {
   return h.createdDate <= date && (!h.archivedDate || date < h.archivedDate);
 }
@@ -54,7 +69,9 @@ export function buildBoards(db, today) {
   );
   const perHabitDays = new Map(); // habitId -> playerId -> Set(dates)
   const playerDays = new Map(); // playerId -> date -> Set(habitIds)
-  for (const key of Object.keys(db.habitChecks)) {
+  const n = db.players.length;
+  for (const [key, check] of Object.entries(db.habitChecks)) {
+    if (isBusted(check, n)) continue;
     const [date, habitId, playerId] = key.split("|");
     const row = rows.get(playerId);
     if (!row) continue;
@@ -71,7 +88,8 @@ export function buildBoards(db, today) {
     byDate.get(date).add(habitId);
   }
   const taskOwner = new Map(db.tasks.map((t) => [t.id, t.playerId]));
-  for (const key of Object.keys(db.taskChecks)) {
+  for (const [key, check] of Object.entries(db.taskChecks)) {
+    if (isBusted(check, n)) continue;
     const [date, taskId] = key.split("|");
     const row = rows.get(taskOwner.get(taskId));
     if (!row) continue;

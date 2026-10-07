@@ -122,6 +122,7 @@ function renderMain() {
       h("button", { class: tab === id ? "on" : "", onclick: () => { tab = id; store.set("lockin-tab", id); renderMain(); } },
         h("b", {}, icon), label))));
   if (tab === "chat") scrollChat();
+  renderModal();
 }
 
 // ---------- Today ----------
@@ -140,11 +141,13 @@ function viewToday() {
         h("span", { class: "pill" }, `${habitsFor.filter((x) => myDone.has(x.id)).length}/${habitsFor.length}`)),
       habitsFor.map((x) => {
         const dones = isToday ? S.sharedToday[x.id] || [] : [];
+        const ref = { date, kind: "habit", refId: x.id, playerId: S.me };
         return h("div", { class: "row" },
-          h("button", { class: `check ${myDone.has(x.id) ? "on" : ""}`, "aria-label": `Toggle ${x.name}`,
-            onclick: () => act("POST", "/api/habit-check", { habitId: x.id, date, done: !myDone.has(x.id) }) }),
+          checkButton(ref, myDone.has(x.id), x.name),
           h("span", { class: "label" }, `${x.emoji} ${x.name}`),
-          isToday && h("span", { class: "dots" }, dones.map((id) => avatar(player(id), 20))),
+          isToday && h("span", { class: "dots" }, dones.map((id) =>
+            h("button", { class: "dotbtn", title: `See ${player(id).name}'s proof`,
+              onclick: () => openProof({ date, kind: "habit", refId: x.id, playerId: id }) }, avatar(player(id), 20)))),
           isToday && h("button", { class: "x", title: "Remove habit for everyone", onclick: () => {
             if (confirm(`Remove "${x.name}" for the whole crew? Past points are kept.`)) act("DELETE", `/api/habits/${x.id}`);
           } }, "×"));
@@ -155,7 +158,7 @@ function viewToday() {
         h("span", { class: "pill" }, `${tasks.filter((t) => t.done).length}/${tasks.length}`)),
       tasks.length === 0 && h("div", { class: "muted" }, "Nothing here yet."),
       tasks.map((t) => h("div", { class: "row" },
-        h("button", { class: `check ${t.done ? "on" : ""}`, onclick: () => act("POST", "/api/task-check", { taskId: t.id, date, done: !t.done }) }),
+        checkButton({ date, kind: "task", refId: t.id, playerId: S.me }, t.done, t.text),
         h("span", { class: "label" }, t.text, t.daily && h("span", { class: "pill", style: "margin-left:8px" }, "daily")),
         isToday && h("button", { class: "x", onclick: () => act("DELETE", `/api/tasks/${t.id}`) }, "×"))),
       isToday && addTaskForm()));
@@ -237,9 +240,11 @@ function viewCrew() {
       h("h2", {}, h("span", { style: "display:flex;align-items:center;gap:8px" }, avatar(p), p.name),
         h("span", { class: "pill" }, `${done.length}/${S.habits.length} shared`)),
       S.habits.map((x) => h("div", { class: "row" },
-        h("span", { class: "label" }, `${x.emoji} ${x.name}`), h("span", {}, done.includes(x) ? "✅" : "⬜"))),
+        h("span", { class: "label" }, `${x.emoji} ${x.name}`),
+        crewMark({ date: S.today, kind: "habit", refId: x.id, playerId: p.id }, done.includes(x)))),
       tasks.length > 0 && h("div", { class: "muted", style: "margin-top:8px" }, "Personal list"),
-      tasks.map((t) => h("div", { class: "row" }, h("span", { class: "label" }, t.text), h("span", {}, t.done ? "✅" : "⬜"))));
+      tasks.map((t) => h("div", { class: "row" }, h("span", { class: "label" }, t.text),
+        crewMark({ date: S.today, kind: "task", refId: t.id, playerId: p.id }, t.done))));
   });
 }
 
@@ -277,6 +282,105 @@ function viewChat() {
   return h("section", { class: "card" },
     h("div", { class: "chat", id: "chat" }, S.messages.length ? chatMessages() : h("div", { class: "muted" }, "No messages yet. Talk some trash. ❄️")),
     h("form", { class: "add", onsubmit: submit }, input, h("button", { class: "btn" }, "Send")));
+}
+
+// ---------- photo proof ----------
+const proofOf = (r) => S.proofs.find((x) => x.date === r.date && x.kind === r.kind && x.refId === r.refId && x.playerId === r.playerId);
+const refQuery = (r) => `kind=${r.kind}&id=${r.refId}&date=${r.date}`;
+
+// Unticked -> take/pick a photo (that's what ticks it). Ticked -> look at the proof.
+function checkButton(ref, done, label) {
+  const pr = proofOf(ref);
+  const state = pr?.busted ? "bust" : done ? "on" : "off";
+  return h("button", { class: `check ${state}`, "aria-label": `${label}: ${state === "off" ? "add photo proof" : "view proof"}`,
+    onclick: () => (state === "off" ? pickPhoto(ref) : openProof(ref)) }, state === "bust" ? "🚨" : null);
+}
+function crewMark(ref, done) {
+  const pr = proofOf(ref);
+  if (pr?.busted) return h("button", { class: "x", onclick: () => openProof(ref) }, "🚨");
+  if (!done) return h("span", {}, "⬜");
+  return h("button", { class: "x", title: "View proof", onclick: () => openProof(ref) }, pr ? "📷" : "✅");
+}
+
+async function toJpeg(file) {
+  const bmp = await createImageBitmap(file, { imageOrientation: "from-image" });
+  const scale = Math.min(1, 1280 / Math.max(bmp.width, bmp.height));
+  const c = document.createElement("canvas");
+  c.width = Math.round(bmp.width * scale); c.height = Math.round(bmp.height * scale);
+  c.getContext("2d").drawImage(bmp, 0, 0, c.width, c.height);
+  return new Promise((res, rej) => c.toBlob((b) => (b ? res(b) : rej(new Error("Couldn't read that photo"))), "image/jpeg", 0.72));
+}
+
+function pickPhoto(ref) {
+  const input = h("input", { type: "file", accept: "image/*", capture: "environment", style: "display:none" });
+  input.addEventListener("change", async () => {
+    const file = input.files[0];
+    input.remove();
+    if (!file) return;
+    const busy = h("div", { class: "overlay" }, h("div", { class: "sheet" }, "Uploading proof…"));
+    document.body.append(busy);
+    try {
+      const blob = await toJpeg(file);
+      const res = await fetch(`/api/proof?${refQuery(ref)}`, {
+        method: "POST", headers: { Authorization: `Bearer ${token}`, "Content-Type": "image/jpeg" }, body: blob });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || "Upload failed");
+      S = data; closeModal(); renderMain();
+    } catch (e) { alert(e.message); }
+    busy.remove();
+  });
+  document.body.append(input);
+  input.click();
+}
+
+const photoUrls = new Map(); // proofId -> Promise<objectURL> (images need the auth header, so fetch as blob)
+function photoUrl(proofId) {
+  if (!photoUrls.has(proofId)) {
+    photoUrls.set(proofId, fetch(`/api/proof/${proofId}`, { headers: { Authorization: `Bearer ${token}` } })
+      .then((r) => { if (!r.ok) throw new Error(); return r.blob(); }).then((b) => URL.createObjectURL(b)));
+  }
+  return photoUrls.get(proofId);
+}
+
+let modalRef = null;
+function closeModal() { modalRef = null; document.getElementById("modal")?.remove(); }
+function openProof(ref) { modalRef = ref; renderModal(); }
+function itemName(ref) {
+  if (ref.kind === "habit") { const x = S.habits.find((y) => y.id === ref.refId); return x ? `${x.emoji} ${x.name}` : "habit"; }
+  for (const d of Object.values(S.tasks)) { const t = d.find((y) => y.id === ref.refId); if (t) return t.text; }
+  return "task";
+}
+function renderModal() {
+  document.getElementById("modal")?.remove();
+  if (!modalRef || !S) return;
+  const ref = modalRef, pr = proofOf(ref), owner = player(ref.playerId), mine = ref.playerId === S.me;
+  if (!pr && !mine) { closeModal(); return; }
+  const needed = Math.floor(Math.max(1, S.players.length - 1) / 2) + 1; // majority of the others (matches server)
+  const calls = pr ? pr.calls : [];
+  const iCalled = calls.includes(S.me);
+  const img = h("img", { class: "proofimg", alt: "proof" });
+  if (pr) photoUrl(pr.proofId).then((u) => (img.src = u)).catch(() => img.replaceWith(h("div", { class: "muted" }, "Photo missing")));
+  const remove = () => act("POST", ref.kind === "habit" ? "/api/habit-check" : "/api/task-check",
+    { habitId: ref.refId, taskId: ref.refId, date: ref.date, done: false }).then(closeModal);
+  const modal = h("div", { class: "overlay", id: "modal", onclick: (e) => e.target.classList.contains("overlay") && closeModal() },
+    h("div", { class: "sheet" },
+      h("div", { class: "row", style: "border:0;padding-top:0" }, avatar(owner), h("div", { class: "label" },
+        h("b", {}, mine ? "You" : owner.name), ` · ${itemName(ref)}`,
+        h("div", { class: "muted" }, pr ? new Date(pr.ts).toLocaleString(undefined, { weekday: "short", hour: "numeric", minute: "2-digit" }) : "")),
+        h("button", { class: "x", onclick: closeModal }, "✕")),
+      pr ? img : h("div", { class: "muted" }, "Checked off before photo proof existed."),
+      pr?.busted && h("div", { class: "busted" }, "🚨 BUSTED. The crew says it's fake, so it doesn't count."),
+      pr && h("div", { class: "muted", style: "margin:8px 0" }, calls.length
+        ? `🚨 Called fake by ${calls.map((id) => player(id).name).join(", ")} (${calls.length}/${needed} to bust)`
+        : `Nobody's called it fake. ${needed} call${needed > 1 ? "s" : ""} busts it.`),
+      mine
+        ? h("div", { class: "add" },
+            h("button", { class: "btn ghost", onclick: () => { closeModal(); pickPhoto(ref); } }, "Replace photo"),
+            h("button", { class: "btn ghost", onclick: remove }, "Uncheck"))
+        : h("button", { class: iCalled ? "btn ghost" : "btn danger", style: "width:100%",
+            onclick: () => act("POST", "/api/call-out", { kind: ref.kind, id: ref.refId, date: ref.date, ownerId: ref.playerId, on: !iCalled }) },
+            iCalled ? "Take it back" : "🚨 Call gangster. This is fake")));
+  document.body.append(modal);
 }
 
 // ---------- boot ----------

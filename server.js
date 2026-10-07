@@ -3,7 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
 import { fileURLToPath } from "node:url";
-import { addDays, buildBoards, habitActiveOn, taskActiveOn } from "./scoring.js";
+import { addDays, buildBoards, habitActiveOn, isBusted, taskActiveOn } from "./scoring.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT || 3000);
@@ -13,6 +13,8 @@ const TIMEZONE = process.env.TIMEZONE || "America/New_York";
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, "data");
 const DB_FILE = path.join(DATA_DIR, "db.json");
 const PUBLIC_DIR = path.join(__dirname, "public");
+const PROOF_DIR = path.join(DATA_DIR, "proofs");
+const MAX_PROOF_BYTES = 4_000_000;
 const COLORS = ["#7dd3fc", "#f9a8d4", "#fcd34d", "#86efac", "#c4b5fd", "#fdba74"];
 
 const uid = () => crypto.randomBytes(6).toString("hex");
@@ -84,6 +86,30 @@ function checkDate(date) {
   return date;
 }
 
+// A check counts unless the crew has busted it.
+const counts = (check) => !!check && !isBusted(check, db.players.length);
+
+function proofsFor(dates) {
+  const out = [];
+  const add = (store, kind, keyToRef) => {
+    for (const [key, check] of Object.entries(store)) {
+      if (typeof check !== "object" || !dates.includes(key.split("|")[0])) continue;
+      const { date, refId, playerId } = keyToRef(key.split("|"));
+      out.push({
+        date, kind, refId, playerId,
+        proofId: check.proof,
+        ts: check.ts,
+        calls: Object.keys(check.calls || {}),
+        busted: isBusted(check, db.players.length),
+      });
+    }
+  };
+  add(db.habitChecks, "habit", ([date, refId, playerId]) => ({ date, refId, playerId }));
+  const owner = new Map(db.tasks.map((t) => [t.id, t.playerId]));
+  add(db.taskChecks, "task", ([date, refId]) => ({ date, refId, playerId: owner.get(refId) }));
+  return out;
+}
+
 function stateFor(me) {
   const today = todayStr();
   const weekDays = Array.from({ length: 7 }, (_, i) => addDays(today, i - 6));
@@ -91,7 +117,7 @@ function stateFor(me) {
   for (const h of db.habits) {
     if (h.archivedDate) continue;
     sharedToday[h.id] = db.players
-      .filter((p) => db.habitChecks[`${today}|${h.id}|${p.id}`])
+      .filter((p) => counts(db.habitChecks[`${today}|${h.id}|${p.id}`]))
       .map((p) => p.id);
   }
   const tasksFor = (date) =>
@@ -102,12 +128,12 @@ function stateFor(me) {
         playerId: t.playerId,
         text: t.text,
         daily: t.daily,
-        done: !!db.taskChecks[`${date}|${t.id}`],
+        done: counts(db.taskChecks[`${date}|${t.id}`]),
       }));
   const myChecks = {}; // date -> habitIds done by me (for yesterday catch-up + week strip)
   for (const d of weekDays) {
     myChecks[d] = db.habits
-      .filter((h) => db.habitChecks[`${d}|${h.id}|${me.id}`])
+      .filter((h) => counts(db.habitChecks[`${d}|${h.id}|${me.id}`]))
       .map((h) => h.id);
   }
   return {
@@ -125,6 +151,7 @@ function stateFor(me) {
       weekDays.map((d) => [d, db.habits.filter((h) => habitActiveOn(h, d)).map((h) => h.id)]),
     ),
     tasks: { [today]: tasksFor(today), [addDays(today, -1)]: tasksFor(addDays(today, -1)) },
+    proofs: proofsFor([today, addDays(today, -1)]),
     boards: buildBoards(db, today),
     messages: db.messages.slice(-150),
   };
@@ -132,8 +159,8 @@ function stateFor(me) {
 
 // ---------- routes ----------
 const routes = [];
-const route = (method, pattern, handler, { auth = true } = {}) =>
-  routes.push({ method, re: new RegExp(`^${pattern}$`), handler, auth });
+const route = (method, pattern, handler, { auth = true, raw = false } = {}) =>
+  routes.push({ method, re: new RegExp(`^${pattern}$`), handler, auth, raw });
 
 route(
   "POST",
@@ -170,12 +197,79 @@ route(
 
 route("GET", "/api/state", (req, body, me) => stateFor(me));
 
+// Ticking something off needs a photo (see POST /api/proof); this only un-ticks.
+function uncheck(store, key) {
+  const old = store[key];
+  if (old?.proof) fs.rm(path.join(PROOF_DIR, `${old.proof}.jpg`), () => {});
+  delete store[key];
+}
+const requireUncheck = (body) => {
+  if (body.done) throw new HttpError(400, "Upload a photo to check this off");
+};
+
 route("POST", "/api/habit-check", (req, body, me) => {
+  requireUncheck(body);
   const habit = db.habits.find((h) => h.id === body.habitId && !h.archivedDate);
   if (!habit) throw new HttpError(404, "No such habit");
-  const key = `${checkDate(body.date)}|${habit.id}|${me.id}`;
-  if (body.done) db.habitChecks[key] = 1;
-  else delete db.habitChecks[key];
+  uncheck(db.habitChecks, `${checkDate(body.date)}|${habit.id}|${me.id}`);
+  save();
+  return stateFor(me);
+});
+
+// Resolve which check store/key a proof upload or call-out refers to.
+function checkTarget(kind, id, date, ownerId) {
+  date = checkDate(date);
+  if (kind === "habit") {
+    const habit = db.habits.find((h) => h.id === id && !h.archivedDate);
+    if (!habit || !habitActiveOn(habit, date)) throw new HttpError(404, "No such habit");
+    return { store: db.habitChecks, key: `${date}|${habit.id}|${ownerId}` };
+  }
+  if (kind === "task") {
+    const task = db.tasks.find((t) => t.id === id);
+    if (!task || !taskActiveOn(task, date)) throw new HttpError(404, "No such task");
+    if (task.playerId !== ownerId) throw new HttpError(404, "No such task");
+    return { store: db.taskChecks, key: `${date}|${task.id}` };
+  }
+  throw new HttpError(400, "Bad kind");
+}
+
+route(
+  "POST",
+  "/api/proof",
+  (req, buf, me) => {
+    const q = new URL(req.url, "http://x").searchParams;
+    const { store, key } = checkTarget(q.get("kind"), q.get("id"), q.get("date"), me.id);
+    if (!buf.length) throw new HttpError(400, "No photo received");
+    if (buf[0] !== 0xff || buf[1] !== 0xd8 || buf[2] !== 0xff) throw new HttpError(400, "Photo must be a JPEG");
+    const proof = crypto.randomBytes(8).toString("hex");
+    fs.mkdirSync(PROOF_DIR, { recursive: true });
+    fs.writeFileSync(path.join(PROOF_DIR, `${proof}.jpg`), buf);
+    uncheck(store, key); // replacing a photo also clears old call-outs
+    store[key] = { proof, ts: Date.now(), calls: {} };
+    save();
+    return stateFor(me);
+  },
+  { raw: true },
+);
+
+route("GET", "/api/proof/([a-f0-9]{16})", (req, body, me, [id]) => {
+  try {
+    return { raw: fs.readFileSync(path.join(PROOF_DIR, `${id}.jpg`)), type: "image/jpeg" };
+  } catch {
+    throw new HttpError(404, "Photo not found");
+  }
+});
+
+// Call "gangster" on someone's proof (or take the call back).
+route("POST", "/api/call-out", (req, body, me) => {
+  if (body.ownerId === me.id) throw new HttpError(400, "You can't call yourself out");
+  if (!db.players.some((p) => p.id === body.ownerId)) throw new HttpError(404, "Unknown player");
+  const { store, key } = checkTarget(body.kind, body.id, body.date, body.ownerId);
+  const check = store[key];
+  if (!check || typeof check !== "object") throw new HttpError(404, "Nothing to call out");
+  check.calls ||= {};
+  if (body.on) check.calls[me.id] = Date.now();
+  else delete check.calls[me.id];
   save();
   return stateFor(me);
 });
@@ -221,13 +315,11 @@ route("POST", "/api/tasks", (req, body, me) => {
 });
 
 route("POST", "/api/task-check", (req, body, me) => {
+  requireUncheck(body);
   const date = checkDate(body.date);
   const task = db.tasks.find((t) => t.id === body.taskId);
   if (!task || task.playerId !== me.id) throw new HttpError(404, "No such task");
-  if (!taskActiveOn(task, date)) throw new HttpError(400, "Task not active that day");
-  const key = `${date}|${task.id}`;
-  if (body.done) db.taskChecks[key] = 1;
-  else delete db.taskChecks[key];
+  uncheck(db.taskChecks, `${date}|${task.id}`);
   save();
   return stateFor(me);
 });
@@ -261,18 +353,20 @@ const MIME = {
   ".png": "image/png",
 };
 
-function readBody(req) {
+function readBody(req, { raw = false } = {}) {
+  const limit = raw ? MAX_PROOF_BYTES : 50_000;
   return new Promise((resolve, reject) => {
     let size = 0;
     const chunks = [];
     req.on("data", (c) => {
       size += c.length;
-      if (size > 50_000) {
+      if (size > limit) {
         reject(new HttpError(413, "Body too large"));
         req.destroy();
       } else chunks.push(c);
     });
     req.on("end", () => {
+      if (raw) return resolve(Buffer.concat(chunks));
       if (!chunks.length) return resolve({});
       try {
         resolve(JSON.parse(Buffer.concat(chunks).toString("utf8")));
@@ -318,8 +412,13 @@ export const server = http.createServer(async (req, res) => {
         me = db.players.find((p) => p.id === db.sessions[token]);
         if (!me) throw new HttpError(401, "Please log in again");
       }
-      const body = req.method === "GET" ? {} : await readBody(req);
-      return sendJson(res, 200, r.handler(req, body, me, m.slice(1)));
+      const body = req.method === "GET" ? {} : await readBody(req, { raw: r.raw });
+      const out = r.handler(req, body, me, m.slice(1));
+      if (out?.raw) {
+        res.writeHead(200, { "Content-Type": out.type, "Cache-Control": "private, max-age=86400" });
+        return res.end(out.raw);
+      }
+      return sendJson(res, 200, out);
     }
     throw new HttpError(404, "Not found");
   } catch (e) {
