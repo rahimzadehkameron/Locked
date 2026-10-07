@@ -61,13 +61,11 @@ test("api end to end", async () => {
   const img = await fetch(`${base}/api/proof/${pr.proofId}`, { headers: { Authorization: `Bearer ${b.token}` } });
   assert.equal(img.headers.get("content-type"), "image/jpeg");
 
-  // call-outs: majority of the other players busts it (2 of 2 here); own proof can't be called
+  // call-outs: a single BS call flags it; own proof can't be called
   const c = (await call("POST", "/api/login", { passcode: "pw", newName: "Cy" })).data;
   const callOut = (tok, on = true) => call("POST", "/api/call-out", { kind: "task", id: task.id, date: s.today, ownerId: a.playerId, on }, tok);
   assert.equal((await callOut(a.token)).status, 400);
   s = (await callOut(b.token)).data;
-  assert.equal(s.proofs.find((x) => x.kind === "task").busted, false); // one call isn't enough
-  s = (await callOut(c.token)).data;
   assert.equal(s.proofs.find((x) => x.kind === "task").busted, true);
   assert.equal(s.boards.points.find((r) => r.playerId === a.playerId).total, 12);
   s = (await callOut(b.token, false)).data;

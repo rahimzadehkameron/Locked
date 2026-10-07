@@ -355,7 +355,6 @@ function renderModal() {
   if (!modalRef || !S) return;
   const ref = modalRef, pr = proofOf(ref), owner = player(ref.playerId), mine = ref.playerId === S.me;
   if (!pr && !mine) { closeModal(); return; }
-  const needed = Math.floor(Math.max(1, S.players.length - 1) / 2) + 1; // majority of the others (matches server)
   const calls = pr ? pr.calls : [];
   const iCalled = calls.includes(S.me);
   const img = h("img", { class: "proofimg", alt: "proof" });
@@ -369,17 +368,17 @@ function renderModal() {
         h("div", { class: "muted" }, pr ? new Date(pr.ts).toLocaleString(undefined, { weekday: "short", hour: "numeric", minute: "2-digit" }) : "")),
         h("button", { class: "x", onclick: closeModal }, "✕")),
       pr ? img : h("div", { class: "muted" }, "Checked off before photo proof existed."),
-      pr?.busted && h("div", { class: "busted" }, "🚨 BUSTED. The crew says it's fake, so it doesn't count."),
+      pr?.busted && h("div", { class: "busted" }, "🚨 BS! Someone called this fake, so it doesn't count."),
       pr && h("div", { class: "muted", style: "margin:8px 0" }, calls.length
-        ? `🚨 Called fake by ${calls.map((id) => player(id).name).join(", ")} (${calls.length}/${needed} to bust)`
-        : `Nobody's called it fake. ${needed} call${needed > 1 ? "s" : ""} busts it.`),
+        ? `🚨 BS called by ${calls.map((id) => player(id).name).join(", ")}`
+        : "Looks legit? If not, one BS call flags it."),
       mine
         ? h("div", { class: "add" },
             h("button", { class: "btn ghost", onclick: () => { closeModal(); pickPhoto(ref); } }, "Replace photo"),
             h("button", { class: "btn ghost", onclick: remove }, "Uncheck"))
         : h("button", { class: iCalled ? "btn ghost" : "btn danger", style: "width:100%",
             onclick: () => act("POST", "/api/call-out", { kind: ref.kind, id: ref.refId, date: ref.date, ownerId: ref.playerId, on: !iCalled }) },
-            iCalled ? "Take it back" : "🚨 Call gangster. This is fake")));
+            iCalled ? "Take it back" : "🚨 Call BS")));
   document.body.append(modal);
 }
 

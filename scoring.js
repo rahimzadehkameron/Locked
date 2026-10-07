@@ -33,17 +33,11 @@ export function streaks(daySet, today) {
 
 /**
  * A check is either 1 (legacy, no proof) or { proof, ts, calls: { playerId: ts } }.
- * It is "busted" when a majority of the *other* players called it fake.
+ * It is "busted" as soon as any player calls BS on it.
  */
-/** Majority of the other players: 1 of 1, 2 of 2, 2 of 3. */
-export function bustThreshold(playerCount) {
-  return Math.floor(Math.max(1, playerCount - 1) / 2) + 1;
-}
-
-export function isBusted(check, playerCount) {
+export function isBusted(check) {
   const calls = check && typeof check === "object" ? Object.keys(check.calls || {}).length : 0;
-  const needed = bustThreshold(playerCount);
-  return calls >= needed;
+    return calls >= 1;
 }
 
 export function habitActiveOn(h, date) {

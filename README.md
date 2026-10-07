@@ -5,7 +5,7 @@ A tiny web app (works great as a phone home-screen app) for a small crew to hold
 - **Shared habits** (work out, read, sleep, eat healthy… add/remove your own): everyone ticks them daily, **3 pts** each.
 - **Personal to-do lists**: each person's own list (optionally repeating daily), **1 pt** each. Everyone can see everyone's progress in the Crew tab.
 - **Leaderboards**: points (last 7 days / all time), perfect-day streak, and a separate board per habit (current streak, best streak, total days).
-- **Photo proof**: you can't tick anything off without a photo. Tap a ✅/📷 to see someone's proof; if it looks fake, hit **Call gangster**. When a majority of the *other* players call it, it's **busted** and stops counting for points and streaks (redo it with a real photo).
+- **Photo proof**: you can't tick anything off without a photo. Tap a ✅/📷 to see someone's proof; if it looks fake, hit **Call BS**. A single BS call from anyone flags it as **busted** and stops counting for points and streaks (redo it with a real photo).
 - **Chat** for the crew.
 - Login = pick your name + one shared passcode. Max 4 people by default.
 

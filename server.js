@@ -87,7 +87,7 @@ function checkDate(date) {
 }
 
 // A check counts unless the crew has busted it.
-const counts = (check) => !!check && !isBusted(check, db.players.length);
+const counts = (check) => !!check && !isBusted(check);
 
 function proofsFor(dates) {
   const out = [];
@@ -100,7 +100,7 @@ function proofsFor(dates) {
         proofId: check.proof,
         ts: check.ts,
         calls: Object.keys(check.calls || {}),
-        busted: isBusted(check, db.players.length),
+        busted: isBusted(check),
       });
     }
   };
@@ -260,7 +260,7 @@ route("GET", "/api/proof/([a-f0-9]{16})", (req, body, me, [id]) => {
   }
 });
 
-// Call "gangster" on someone's proof (or take the call back).
+// Call BS on someone's proof (or take the call back).
 route("POST", "/api/call-out", (req, body, me) => {
   if (body.ownerId === me.id) throw new HttpError(400, "You can't call yourself out");
   if (!db.players.some((p) => p.id === body.ownerId)) throw new HttpError(404, "Unknown player");
